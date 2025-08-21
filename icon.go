@@ -1,20 +1,9 @@
 package main
 
-import "fyne.io/fyne/v2"
+import (
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/theme"
+)
 
-// Skapa en enkel ikon med ASCII-art som resource
-var appIcon = &fyne.StaticResource{
-	StaticName:    "icon.png",
-	StaticContent: []byte{}, // Tom för nu, men vi kan lägga till riktigt ikon senare
-}
-
-// ASCII-art ikon för terminal-look
-const terminalIcon = `
-   ████████
-  ██      ██
-  ██ >_   ██
-  ██      ██
-  ██  📊  ██
-  ██      ██
-   ████████
-`
+// Use a built-in theme icon for port scanning application
+var appIcon fyne.Resource = theme.ComputerIcon()
