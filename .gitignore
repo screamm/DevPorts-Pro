@@ -1,0 +1,31 @@
+# Build artifacts
+*.exe
+devports-pro
+devports-web
+devports-cli
+test-scanner
+
+# Go specific
+/go/
+
+# Distribution files
+go1.*.tar.gz
+*.tar.gz
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS specific files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+
+# Log files
+*.log
