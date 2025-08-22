@@ -5,9 +5,10 @@ echo "Building DevPorts Pro for multiple platforms..."
 # Create dist directory
 mkdir -p dist
 
-# Build for Windows (64-bit)
-echo "Building for Windows (64-bit)..."
-GOOS=windows GOARCH=amd64 go build -ldflags "-H=windowsgui -w -s" -o dist/devports-pro-windows.exe main.go port_scanner.go
+# Build for Windows (64-bit) with icon
+echo "Building for Windows (64-bit) with icon..."
+# Note: app.syso must be compiled first with: windres -o app.syso app.rc
+GOOS=windows GOARCH=amd64 go build -ldflags "-H=windowsgui -w -s" -o dist/devports-pro-windows.exe
 
 # Build for macOS (64-bit Intel)
 echo "Building for macOS (64-bit Intel)..."  
