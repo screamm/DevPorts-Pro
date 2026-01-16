@@ -1,15 +1,25 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"os/exec"
+	"regexp"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
+)
+
+var (
+	netstatCache     string
+	netstatCacheMu   sync.RWMutex
+	netstatCacheTime time.Time
+	netstatCacheTTL  = 2 * time.Second
 )
 
 type PortInfo struct {
@@ -20,21 +30,26 @@ type PortInfo struct {
 }
 
 func ScanPorts() []PortInfo {
-	fmt.Println("Scanning ports 1-9999...")
 	var activePorts []PortInfo
 	var mutex sync.Mutex
 
 	// Use worker pool with channel for concurrent scanning
-	portChan := make(chan int, 9999)
+	portChan := make(chan int, AppConfig.PortRangeEnd)
 	resultChan := make(chan PortInfo, 100)
 	var wg sync.WaitGroup
 
-	// Start 500 concurrent workers for fast scanning
-	numWorkers := 500
+	// Start concurrent workers for fast scanning
+	numWorkers := AppConfig.NumWorkers
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					// Worker recovered from panic - continue without crashing
+					// The port will simply not be reported
+				}
+			}()
 			for port := range portChan {
 				if isPortOpen(port) {
 					pid, process := getProcessInfo(port)
@@ -56,13 +71,12 @@ func ScanPorts() []PortInfo {
 			mutex.Lock()
 			activePorts = append(activePorts, portInfo)
 			mutex.Unlock()
-			fmt.Printf("Found active port: %d (PID: %s, Process: %s)\n", portInfo.Port, portInfo.PID, portInfo.Process)
 		}
 		done <- true
 	}()
 
 	// Send ports to workers
-	for port := 1; port <= 9999; port++ {
+	for port := AppConfig.PortRangeStart; port <= AppConfig.PortRangeEnd; port++ {
 		portChan <- port
 	}
 	close(portChan)
@@ -77,12 +91,11 @@ func ScanPorts() []PortInfo {
 		return activePorts[i].Port < activePorts[j].Port
 	})
 
-	fmt.Printf("Scan complete. Found %d active ports.\n", len(activePorts))
 	return activePorts
 }
 
 func isPortOpen(port int) bool {
-	timeout := time.Millisecond * 100
+	timeout := AppConfig.PortTimeout
 
 	// Check IPv4 first (most common)
 	conn4, err4 := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), timeout)
@@ -101,25 +114,74 @@ func isPortOpen(port int) bool {
 	return false
 }
 
-func getProcessInfo(port int) (string, string) {
-	var cmd *exec.Cmd
-
-	if runtime.GOOS == "windows" {
-		cmd = exec.Command("netstat", "-ano")
-		// Dölj konsol-fönster på Windows
-		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-	} else {
-		cmd = exec.Command("lsof", "-i", fmt.Sprintf(":%d", port))
+func getCachedNetstatOutput(ctx context.Context) (string, error) {
+	// Check cache first
+	netstatCacheMu.RLock()
+	if time.Since(netstatCacheTime) < netstatCacheTTL && netstatCache != "" {
+		cached := netstatCache
+		netstatCacheMu.RUnlock()
+		return cached, nil
 	}
+	netstatCacheMu.RUnlock()
 
+	// Cache miss or expired - run netstat
+	cmd := exec.CommandContext(ctx, "netstat", "-ano")
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	output, err := cmd.Output()
 	if err != nil {
-		return "Unknown", "Unknown"
+		return "", err
 	}
 
-	lines := strings.Split(string(output), "\n")
+	// Update cache
+	netstatCacheMu.Lock()
+	netstatCache = string(output)
+	netstatCacheTime = time.Now()
+	netstatCacheMu.Unlock()
+
+	return string(output), nil
+}
+
+func clearNetstatCache() {
+	netstatCacheMu.Lock()
+	netstatCache = ""
+	netstatCacheTime = time.Time{}
+	netstatCacheMu.Unlock()
+}
+
+func getProcessInfo(port int) (string, string) {
+	ctx, cancel := context.WithTimeout(context.Background(), AppConfig.CommandTimeout)
+	defer cancel()
+
+	var output string
+	var err error
+
+	if runtime.GOOS == "windows" {
+		output, err = getCachedNetstatOutput(ctx)
+		if err != nil {
+			if ctx.Err() == context.DeadlineExceeded {
+				return "Timeout", "Timeout"
+			}
+			return "Unknown", "Unknown"
+		}
+	} else {
+		cmd := exec.CommandContext(ctx, "lsof", "-i", fmt.Sprintf(":%d", port))
+		outputBytes, cmdErr := cmd.Output()
+		if cmdErr != nil {
+			if ctx.Err() == context.DeadlineExceeded {
+				return "Timeout", "Timeout"
+			}
+			return "Unknown", "Unknown"
+		}
+		output = string(outputBytes)
+	}
+
+	// Use regex for exact port match - handles LISTENING, ESTABLISHED, end of line, and CRLF
+	// Match patterns like ":80 ", ":80\t", ":80\r", or ":80" at end of line
+	portPattern := regexp.MustCompile(fmt.Sprintf(`[:\s]%d(?:[\s\t\r]|$)`, port))
+
+	lines := strings.Split(output, "\n")
 	for _, line := range lines {
-		if strings.Contains(line, fmt.Sprintf(":%d", port)) {
+		if portPattern.MatchString(line) {
 			if runtime.GOOS == "windows" {
 				fields := strings.Fields(line)
 				if len(fields) >= 5 {
@@ -142,12 +204,18 @@ func getProcessInfo(port int) (string, string) {
 }
 
 func getProcessName(pid string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), AppConfig.CommandTimeout)
+	defer cancel()
+
 	if runtime.GOOS == "windows" {
-		cmd := exec.Command("tasklist", "/fi", fmt.Sprintf("PID eq %s", pid), "/fo", "csv")
-		// Dölj konsol-fönster på Windows
+		cmd := exec.CommandContext(ctx, "tasklist", "/fi", fmt.Sprintf("PID eq %s", pid), "/fo", "csv")
+		// Hide console window on Windows
 		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 		output, err := cmd.Output()
 		if err != nil {
+			if ctx.Err() == context.DeadlineExceeded {
+				return "Timeout"
+			}
 			return "Unknown"
 		}
 
@@ -159,9 +227,12 @@ func getProcessName(pid string) string {
 			}
 		}
 	} else {
-		cmd := exec.Command("ps", "-p", pid, "-o", "comm=")
+		cmd := exec.CommandContext(ctx, "ps", "-p", pid, "-o", "comm=")
 		output, err := cmd.Output()
 		if err != nil {
+			if ctx.Err() == context.DeadlineExceeded {
+				return "Timeout"
+			}
 			return "Unknown"
 		}
 		return strings.TrimSpace(string(output))
@@ -171,20 +242,37 @@ func getProcessName(pid string) string {
 }
 
 func KillProcess(pid string) error {
+	// Validate PID is a valid positive integer
+	pidNum, err := strconv.Atoi(pid)
+	if err != nil || pidNum <= 0 {
+		return fmt.Errorf("invalid PID: %q", pid)
+	}
+
+	// Protect against killing critical system processes
+	if runtime.GOOS == "windows" && pidNum <= 4 {
+		return fmt.Errorf("cannot kill system process (PID %d)", pidNum)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), AppConfig.CommandTimeout)
+	defer cancel()
+
 	var cmd *exec.Cmd
 
 	if runtime.GOOS == "windows" {
-		cmd = exec.Command("taskkill", "/PID", pid, "/F")
-		// Dölj konsol-fönster på Windows
+		cmd = exec.CommandContext(ctx, "taskkill", "/PID", pid, "/F")
+		// Hide console window on Windows
 		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	} else {
-		cmd = exec.Command("kill", "-9", pid)
+		cmd = exec.CommandContext(ctx, "kill", "-9", pid)
 	}
 
-	err := cmd.Run()
+	err = cmd.Run()
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to kill process %s: %w", pid, err)
 	}
+
+	// Clear netstat cache since process state changed
+	clearNetstatCache()
 
 	// Verify process is actually killed by checking if PID still exists
 	return verifyProcessKilled(pid)
@@ -192,19 +280,22 @@ func KillProcess(pid string) error {
 
 func verifyProcessKilled(pid string) error {
 	// Try multiple times with increasing delays
-	maxAttempts := 5
+	maxAttempts := AppConfig.KillVerifyAttempts
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		time.Sleep(time.Duration(200*(attempt+1)) * time.Millisecond)
+		time.Sleep(time.Duration(int(AppConfig.KillVerifyBaseDelay.Milliseconds())*(attempt+1)) * time.Millisecond)
+
+		ctx, cancel := context.WithTimeout(context.Background(), AppConfig.CommandTimeout)
 
 		var cmd *exec.Cmd
 		if runtime.GOOS == "windows" {
-			cmd = exec.Command("tasklist", "/fi", fmt.Sprintf("PID eq %s", pid), "/fo", "csv", "/nh")
+			cmd = exec.CommandContext(ctx, "tasklist", "/fi", fmt.Sprintf("PID eq %s", pid), "/fo", "csv", "/nh")
 			cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 		} else {
-			cmd = exec.Command("ps", "-p", pid, "-o", "pid=")
+			cmd = exec.CommandContext(ctx, "ps", "-p", pid, "-o", "pid=")
 		}
 
 		output, err := cmd.Output()
+		cancel() // Release context resources
 
 		if runtime.GOOS == "windows" {
 			// On Windows, check if tasklist returns actual process info

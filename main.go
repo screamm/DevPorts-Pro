@@ -3,6 +3,8 @@ package main
 import (
 	"fmt"
 	"image/color"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -14,28 +16,39 @@ import (
 	"fyne.io/fyne/v2/widget"
 )
 
+const AppVersion = "1.2.0"
+
 type DevPortsApp struct {
-	myApp      fyne.App
-	myWindow   fyne.Window
-	table      *widget.Table
-	refreshBtn *widget.Button
-	statusLbl  *widget.Label
-	ports      []PortInfo
-	isScanning bool
+	myApp          fyne.App
+	myWindow       fyne.Window
+	table          *widget.Table
+	refreshBtn     *widget.Button
+	statusLbl      *widget.Label
+	ports          []PortInfo
+	portsMu        sync.RWMutex  // protects ports slice
+	isScanning     atomic.Bool
+	pendingRefresh atomic.Bool   // prevents multiple refresh goroutines
+	quit           chan struct{}
 }
 
 func main() {
+	// Validate configuration at startup
+	if err := AppConfig.Validate(); err != nil {
+		panic(fmt.Sprintf("Invalid configuration: %v", err))
+	}
+
 	myApp := app.New()
 	myApp.SetIcon(appIcon)
 
 	myWindow := myApp.NewWindow("⚡ DevPorts Pro - Port Scanner")
-	myWindow.Resize(fyne.NewSize(1100, 800))
+	myWindow.Resize(fyne.NewSize(AppConfig.WindowWidth, AppConfig.WindowHeight))
 	myWindow.CenterOnScreen()
 
 	devApp := &DevPortsApp{
 		myApp:    myApp,
 		myWindow: myWindow,
 		ports:    make([]PortInfo, 0),
+		quit:     make(chan struct{}),
 	}
 
 	devApp.buildUI(myWindow)
@@ -45,6 +58,11 @@ func main() {
 
 	// Start auto-refresh timer (5 minutes)
 	go devApp.startAutoRefresh()
+
+	// Graceful shutdown handler
+	myWindow.SetOnClosed(func() {
+		close(devApp.quit)
+	})
 
 	myWindow.ShowAndRun()
 }
@@ -58,7 +76,7 @@ func (da *DevPortsApp) buildUI(w fyne.Window) {
 	header.TextStyle.Monospace = true
 	header.Alignment = fyne.TextAlignCenter
 
-	title := canvas.NewText("⚡ DevPorts Pro v1.0 - Port Scanner", color.RGBA{0, 255, 200, 255})
+	title := canvas.NewText(fmt.Sprintf("⚡ DevPorts Pro v%s - Port Scanner", AppVersion), color.RGBA{0, 255, 200, 255})
 	title.TextStyle.Monospace = true
 	title.TextStyle.Bold = true
 	title.Alignment = fyne.TextAlignCenter
@@ -74,7 +92,7 @@ func (da *DevPortsApp) buildUI(w fyne.Window) {
 
 	// Refresh button with improved styling
 	da.refreshBtn = widget.NewButton("⟳ Refresh Scan", func() {
-		if !da.isScanning {
+		if !da.isScanning.Load() {
 			go da.scanPorts()
 		}
 	})
@@ -83,7 +101,10 @@ func (da *DevPortsApp) buildUI(w fyne.Window) {
 	// Create table with compact rows
 	da.table = widget.NewTable(
 		func() (int, int) {
-			return len(da.ports) + 1, 4 // +1 for header
+			da.portsMu.RLock()
+			count := len(da.ports)
+			da.portsMu.RUnlock()
+			return count + 1, 4 // +1 for header
 		},
 		func() fyne.CanvasObject {
 			label := widget.NewLabel("template")
@@ -91,6 +112,11 @@ func (da *DevPortsApp) buildUI(w fyne.Window) {
 			return container.NewHBox(label)
 		},
 		func(i widget.TableCellID, o fyne.CanvasObject) {
+			cell, ok := o.(*fyne.Container)
+			if !ok {
+				return
+			}
+
 			if i.Row == 0 {
 				// Header row
 				var text string
@@ -106,32 +132,45 @@ func (da *DevPortsApp) buildUI(w fyne.Window) {
 				}
 				label := widget.NewLabel(text)
 				label.TextStyle.Bold = true
-				o.(*fyne.Container).Objects = []fyne.CanvasObject{label}
-			} else if i.Row-1 < len(da.ports) {
-				port := da.ports[i.Row-1]
-				switch i.Col {
-				case 0:
-					label := widget.NewLabel(fmt.Sprintf("%d", port.Port))
-					o.(*fyne.Container).Objects = []fyne.CanvasObject{label}
-				case 1:
-					label := widget.NewLabel(port.PID)
-					o.(*fyne.Container).Objects = []fyne.CanvasObject{label}
-				case 2:
-					label := widget.NewLabel(port.Process)
-					o.(*fyne.Container).Objects = []fyne.CanvasObject{label}
-				case 3:
-					if port.PID != "Unknown" && port.PID != "" {
-						killBtn := widget.NewButton("⨯ Kill", func() {
-							da.showKillConfirmation(port.PID, port.Port, port.Process)
-						})
-						killBtn.Importance = widget.DangerImportance
-						killBtn.Resize(fyne.NewSize(90, 28))
-						o.(*fyne.Container).Objects = []fyne.CanvasObject{killBtn}
-					} else {
-						label := widget.NewLabel("—")
-						label.Alignment = fyne.TextAlignCenter
-						o.(*fyne.Container).Objects = []fyne.CanvasObject{label}
+				cell.Objects = []fyne.CanvasObject{label}
+			} else {
+				da.portsMu.RLock()
+				if i.Row-1 < len(da.ports) {
+					port := da.ports[i.Row-1]
+					da.portsMu.RUnlock()
+					switch i.Col {
+					case 0:
+						label := widget.NewLabel(fmt.Sprintf("%d", port.Port))
+						cell.Objects = []fyne.CanvasObject{label}
+					case 1:
+						label := widget.NewLabel(port.PID)
+						cell.Objects = []fyne.CanvasObject{label}
+					case 2:
+						label := widget.NewLabel(port.Process)
+						cell.Objects = []fyne.CanvasObject{label}
+					case 3:
+						if port.PID != "Unknown" && port.PID != "" && port.PID != "Timeout" {
+							// Capture values in local variables BEFORE the closure
+							pid := port.PID
+							portNum := port.Port
+							processName := port.Process
+
+							killBtn := widget.NewButton("⨯ Kill", func() {
+								da.showKillConfirmation(pid, portNum, processName)
+							})
+							killBtn.Importance = widget.DangerImportance
+							killBtn.Resize(fyne.NewSize(90, 28))
+							cell.Objects = []fyne.CanvasObject{killBtn}
+						} else {
+							label := widget.NewLabel("—")
+							label.Alignment = fyne.TextAlignCenter
+							cell.Objects = []fyne.CanvasObject{label}
+						}
 					}
+				} else {
+					da.portsMu.RUnlock()
+					// Clear stale data when row is out of bounds
+					cell.Objects = []fyne.CanvasObject{widget.NewLabel("")}
 				}
 			}
 		})
@@ -143,7 +182,12 @@ func (da *DevPortsApp) buildUI(w fyne.Window) {
 	da.table.SetColumnWidth(3, 120) // Action
 
 	// Info banner
-	infoText := canvas.NewText("▸ Scanning ports 1-9999 | Auto-refresh: 5min | Click [Kill] to terminate process", color.RGBA{120, 120, 120, 255})
+	infoText := canvas.NewText(
+		fmt.Sprintf("▸ Scanning ports %d-%d | Auto-refresh: %v | Click [Kill] to terminate process",
+			AppConfig.PortRangeStart,
+			AppConfig.PortRangeEnd,
+			AppConfig.AutoRefreshInterval),
+		color.RGBA{120, 120, 120, 255})
 	infoText.TextStyle.Monospace = true
 	infoText.Alignment = fyne.TextAlignCenter
 	infoText.TextSize = 11
@@ -166,7 +210,9 @@ func (da *DevPortsApp) buildUI(w fyne.Window) {
 	)
 
 	// Footer
-	footerText := canvas.NewText("━━━ DevPorts Pro © 2024 | Press [Refresh Scan] to update ━━━", color.RGBA{0, 255, 150, 200})
+	footerText := canvas.NewText(
+		fmt.Sprintf("━━━ DevPorts Pro © %d | Press [Refresh Scan] to update ━━━", time.Now().Year()),
+		color.RGBA{0, 255, 150, 200})
 	footerText.TextStyle.Monospace = true
 	footerText.Alignment = fyne.TextAlignCenter
 	footerText.TextSize = 10
@@ -184,11 +230,11 @@ func (da *DevPortsApp) buildUI(w fyne.Window) {
 }
 
 func (da *DevPortsApp) scanPorts() {
-	if da.isScanning {
-		return
+	if !da.isScanning.CompareAndSwap(false, true) {
+		return // Already scanning
 	}
+	defer da.isScanning.Store(false)
 
-	da.isScanning = true
 	da.statusLbl.SetText("⟳ Scanning ports...")
 	da.refreshBtn.SetText("⏳ Scanning...")
 	da.refreshBtn.Disable()
@@ -198,13 +244,14 @@ func (da *DevPortsApp) scanPorts() {
 	activePorts := ScanPorts()
 	elapsed := time.Since(startTime)
 
+	da.portsMu.Lock()
 	da.ports = activePorts
+	da.portsMu.Unlock()
 	da.table.Refresh()
 
 	da.statusLbl.SetText(fmt.Sprintf("✓ Scan complete: %d active ports found (%.2fs)", len(activePorts), elapsed.Seconds()))
 	da.refreshBtn.SetText("⟳ Refresh Scan")
 	da.refreshBtn.Enable()
-	da.isScanning = false
 }
 
 func (da *DevPortsApp) showKillConfirmation(pid string, port int, process string) {
@@ -256,24 +303,29 @@ func (da *DevPortsApp) executeKill(pid string) {
 	}
 
 	// Always refresh after kill attempt to show current state
-	go func() {
-		time.Sleep(1500 * time.Millisecond)
-		if !da.isScanning {
-			da.scanPorts()
-		}
-	}()
+	if da.pendingRefresh.CompareAndSwap(false, true) {
+		go func() {
+			time.Sleep(AppConfig.PostKillRefreshDelay)
+			da.pendingRefresh.Store(false)
+			if !da.isScanning.Load() {
+				da.scanPorts()
+			}
+		}()
+	}
 }
 
 func (da *DevPortsApp) startAutoRefresh() {
-	ticker := time.NewTicker(5 * time.Minute)
+	ticker := time.NewTicker(AppConfig.AutoRefreshInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
-			if !da.isScanning {
+			if !da.isScanning.Load() {
 				go da.scanPorts()
 			}
+		case <-da.quit:
+			return // Graceful exit
 		}
 	}
 }
